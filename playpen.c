@@ -603,7 +603,7 @@ int main(int argc, char **argv) {
     const char *root = argv[optind];
     optind++;
 
-    scmp_filter_ctx ctx = seccomp_init(learn != LEARN_NONE ? SCMP_ACT_TRACE(0) : SCMP_ACT_KILL);
+    scmp_filter_ctx ctx = seccomp_init(learn != LEARN_NONE ? SCMP_ACT_TRACE(0) : SCMP_ACT_ERRNO(EPERM));
     if (!ctx) errx(EXIT_FAILURE, "seccomp_init");
 
     FILE *whitelist = NULL;
