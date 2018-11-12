@@ -144,6 +144,7 @@ static void start_scope_unit(sd_bus *connection, pid_t child_pid, long memory_li
     check(sd_bus_message_append(message, "(sv)", "MemoryLimit", "t",
                                 1024ULL * 1024ULL * (unsigned long long)memory_limit));
     check(sd_bus_message_append(message, "(sv)", "TasksMax", "t", (unsigned long long)tasks_max));
+    check(sd_bus_message_append(message, "(sv)", "TimeoutStopUSec", "t", 1000ull));
     check(sd_bus_message_append(message, "(sv)", "DevicePolicy", "s", "strict"));
 
     if (devices) {
