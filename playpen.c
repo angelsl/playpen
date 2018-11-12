@@ -834,7 +834,7 @@ int main(int argc, char **argv) {
 
             if (evt->events & EPOLLIN) {
                 if (evt->data.fd == timer_fd) {
-                    warnx("timeout triggered!");
+                    warnx("time limit exceeded");
                     stop_scope_unit(connection, unit_name);
                     return EXIT_FAILURE;
                 } else if (evt->data.fd == sig_fd) {
