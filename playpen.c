@@ -236,7 +236,8 @@ _Noreturn static void usage(FILE *out) {
           " -s, --syscalls=LIST         semicolon-separated whitelist of syscalls\n"
           " -S, --syscalls-file=PATH    whitelist file containing one syscall name per line\n"
           " -l, --learn                 append missing rules to the system call whitelist\n"
-          " -L, --learn-coarse          coarser learning mode without parameter checks\n",
+          " -L, --learn-coarse          coarser learning mode without parameter checks\n"
+          " -N, --no-cloexec=FD         unset CLOEXEC on the fd (pass it to the spawned child)\n",
           out);
 
     exit(out == stderr ? EXIT_FAILURE : EXIT_SUCCESS);
@@ -525,11 +526,12 @@ int main(int argc, char **argv) {
         { "syscalls-file", required_argument, NULL, 'S' },
         { "learn",         no_argument,       NULL, 'l' },
         { "learn-coarse",  no_argument,       NULL, 'L' },
+        { "no-cloexec",    required_argument, NULL, 'N' },
         { NULL, 0, NULL, 0 }
     };
 
     for (;;) {
-        int opt = getopt_long(argc, argv, "hvpDb:B:u:n:t:m:T:C:d:s:S:lL", opts, NULL);
+        int opt = getopt_long(argc, argv, "hvpDb:B:u:n:t:m:T:C:d:s:S:lLN:", opts, NULL);
         if (opt == -1)
             break;
 
@@ -586,6 +588,9 @@ int main(int argc, char **argv) {
             break;
         case 'L':
             learn = LEARN_COARSE;
+            break;
+        case 'N':
+            check_posix(ioctl(strtolx_positive(optarg, "fd"), FIONCLEX), "ioctl");
             break;
         default:
             usage(stderr);
@@ -690,6 +695,9 @@ int main(int argc, char **argv) {
 
         // Kill this process if the parent dies.
         check_posix(prctl(PR_SET_PDEATHSIG, SIGKILL), "prctl");
+
+        // No new privileges
+        check_posix(prctl(PR_SET_NO_NEW_PRIVS, 1), "prctl");
 
         // Wait until the scope unit is set up before moving on. This also ensures that the parent
         // didn't die before `prctl` was called.
