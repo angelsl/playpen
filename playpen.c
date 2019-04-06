@@ -736,7 +736,7 @@ int main(int argc, char **argv) {
         check_posix(prctl(PR_SET_PDEATHSIG, SIGKILL), "prctl");
 
         // No new privileges
-        check_posix(prctl(PR_SET_NO_NEW_PRIVS, 1), "prctl");
+        check_posix(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), "prctl");
 
         // Wait until the scope unit is set up before moving on. This also ensures that the parent
         // didn't die before `prctl` was called.
