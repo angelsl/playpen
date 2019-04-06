@@ -28,6 +28,11 @@
 #include <sys/reg.h>
 #include <sys/wait.h>
 
+#include <libmnl/libmnl.h>
+#include <linux/if.h>
+#include <linux/if_link.h>
+#include <linux/rtnetlink.h>
+
 #include <seccomp.h>
 #include <systemd/sd-bus.h>
 #include <systemd/sd-login.h>
@@ -237,7 +242,8 @@ _Noreturn static void usage(FILE *out) {
           " -S, --syscalls-file=PATH    whitelist file containing one syscall name per line\n"
           " -l, --learn                 append missing rules to the system call whitelist\n"
           " -L, --learn-coarse          coarser learning mode without parameter checks\n"
-          " -N, --no-cloexec=FD         unset CLOEXEC on the fd (pass it to the spawned child)\n",
+          " -N, --no-cloexec=FD         unset CLOEXEC on the fd (pass it to the spawned child)\n"
+          " -P, --bringup-lo            bring up the loopback interface in the sandbox\n",
           out);
 
     exit(out == stderr ? EXIT_FAILURE : EXIT_SUCCESS);
@@ -479,6 +485,34 @@ static struct scmp_arg_cmp *parse_parameter_checks(char *s, unsigned *count) {
     return args;
 }
 
+static void iff_up_lo(void) {
+    char buf[MNL_SOCKET_BUFFER_SIZE];
+    unsigned int seq = time(NULL);
+    struct nlmsghdr *nlh = mnl_nlmsg_put_header(buf);
+    nlh->nlmsg_type	= RTM_NEWLINK;
+    nlh->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+    nlh->nlmsg_seq = seq;
+    struct ifinfomsg *ifm = mnl_nlmsg_put_extra_header(nlh, sizeof(*ifm));
+    ifm->ifi_family = AF_UNSPEC;
+    ifm->ifi_change = IFF_UP;
+    ifm->ifi_flags = IFF_UP;
+    mnl_attr_put_str(nlh, IFLA_IFNAME, "lo");
+
+    struct mnl_socket *nl = mnl_socket_open(NETLINK_ROUTE);
+    if (!nl) {
+        err(EXIT_FAILURE, "mnl_socket_open");
+    }
+
+    check(mnl_socket_bind(nl, 0, MNL_SOCKET_AUTOPID));
+
+    unsigned int portid = mnl_socket_get_portid(nl);
+    ssize_t bytes;
+    check(mnl_socket_sendto(nl, nlh, nlh->nlmsg_len));
+    check_posix(bytes = mnl_socket_recvfrom(nl, buf, sizeof(buf)), "mnl_socket_recvfrom");
+    check_posix(mnl_cb_run(buf, (size_t) bytes, seq, portid, NULL, NULL), "mnl_cb_run");
+    mnl_socket_close(nl);
+}
+
 static void handle_seccomp_rule(scmp_filter_ctx ctx, char *rule) {
     char *split = strchr(rule, ':');
     struct scmp_arg_cmp *args = NULL;
@@ -496,6 +530,7 @@ int main(int argc, char **argv) {
 
     bool mount_proc = false;
     bool mount_dev = false;
+    bool bringup_lo = false;
     const char *username = "nobody";
     const char *hostname = "playpen";
     long timeout = 0;
@@ -527,11 +562,12 @@ int main(int argc, char **argv) {
         { "learn",         no_argument,       NULL, 'l' },
         { "learn-coarse",  no_argument,       NULL, 'L' },
         { "no-cloexec",    required_argument, NULL, 'N' },
+        { "bringup-lo",    no_argument,       NULL, 'P' },
         { NULL, 0, NULL, 0 }
     };
 
     for (;;) {
-        int opt = getopt_long(argc, argv, "hvpDb:B:u:n:t:m:T:C:d:s:S:lLN:", opts, NULL);
+        int opt = getopt_long(argc, argv, "hvpDb:B:u:n:t:m:T:C:d:s:S:lLN:P", opts, NULL);
         if (opt == -1)
             break;
 
@@ -591,6 +627,9 @@ int main(int argc, char **argv) {
             break;
         case 'N':
             check_posix(ioctl(strtolx_positive(optarg, "fd"), FIONCLEX), "ioctl");
+            break;
+        case 'P':
+            bringup_lo = true;
             break;
         default:
             usage(stderr);
@@ -705,6 +744,10 @@ int main(int argc, char **argv) {
         check_posix(read(STDIN_FILENO, &ready, sizeof(ready)), "read");
 
         check_posix(sethostname(hostname, strlen(hostname)), "sethostname");
+
+        if (bringup_lo) {
+            iff_up_lo();
+        }
 
         // avoid propagating mounts to or from the parent's mount namespace
         mountx(NULL, "/", NULL, MS_PRIVATE|MS_REC, NULL);
