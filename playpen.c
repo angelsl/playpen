@@ -37,12 +37,6 @@
 #include <systemd/sd-bus.h>
 #include <systemd/sd-login.h>
 
-enum learn {
-    LEARN_NONE,
-    LEARN_FINE,
-    LEARN_COARSE
-};
-
 static void check(int rc) {
     if (rc < 0) errx(EXIT_FAILURE, "%s", strerror(-rc));
 }
@@ -240,8 +234,7 @@ _Noreturn static void usage(FILE *out) {
           " -d, --devices=LIST          comma-separated whitelist of devices\n"
           " -s, --syscalls=LIST         semicolon-separated whitelist of syscalls\n"
           " -S, --syscalls-file=PATH    whitelist file containing one syscall name per line\n"
-          " -l, --learn                 append missing rules to the system call whitelist\n"
-          " -L, --learn-coarse          coarser learning mode without parameter checks\n"
+          " -l, --log                   \"learning\" mode: log disallowed syscalls and allow them\n"
           " -N, --no-cloexec=FD         unset CLOEXEC on the fd (pass it to the spawned child)\n"
           " -P, --bringup-lo            bring up the loopback interface in the sandbox\n",
           out);
@@ -280,84 +273,11 @@ static long strtolx_positive(const char *s, const char *what) {
     return result;
 }
 
-#ifdef __x86_64__
-static const int arg_registers[] = {RDI, RSI, RDX, R10, R8, R9};
-#else
-static const int arg_registers[] = {EBX, ECX, EDX, ESI, EDI, EBP};
-#endif
-
-static long get_parameter(pid_t pid, unsigned index) {
-    if (index < 1 || index > sizeof(arg_registers) / sizeof(arg_registers[0])) {
-        errx(EXIT_FAILURE, "parameter index invalid");
-    }
-    return ptrace(PTRACE_PEEKUSER, pid, sizeof(long) * (size_t)arg_registers[index - 1]);
-}
-
-static void do_trace(pid_t pid, int status, enum learn learn, FILE *whitelist) {
+static void do_trace(pid_t pid, int status) {
     int inject_signal = 0;
     if ((status >> 8) == (SIGTRAP | PTRACE_EVENT_SECCOMP << 8)) {
-        errno = 0;
-#ifdef __x86_64__
-        long syscall = ptrace(PTRACE_PEEKUSER, pid, sizeof(long) * ORIG_RAX);
-#else
-        long syscall = ptrace(PTRACE_PEEKUSER, pid, sizeof(long) * ORIG_EAX);
-#endif
-        if (errno) err(EXIT_FAILURE, "ptrace");
-        char *rule = seccomp_syscall_resolve_num_arch(SCMP_ARCH_NATIVE, (int)syscall);
-        if (!rule) errx(EXIT_FAILURE, "seccomp_syscall_resolve_num_arch");
-
-        struct {
-            const char *name;
-            unsigned count, p1, p2;
-        } calls[] = {
-            {"fadvise64",    1, 4, 0},
-            {"fadvise64_64", 1, 2, 0},
-            {"fcntl",        1, 2, 0},
-            {"futex",        1, 2, 0},
-            {"getsockopt",   2, 2, 3},
-            {"ioctl",        1, 2, 0},
-            {"madvise",      1, 3, 0},
-            {"prctl",        1, 1, 0},
-            {"setsockopt",   2, 2, 3}
-        };
-
-        if (learn == LEARN_FINE) {
-            for (size_t i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
-                if (!strcmp(rule, calls[i].name)) {
-                    free(rule);
-                    long value = get_parameter(pid, calls[i].p1);
-                    if (calls[i].count == 1) {
-                        asprintfx(&rule, "%s: %u == %ld", calls[i].name, calls[i].p1, value);
-                    } else {
-                        long value2 = get_parameter(pid, calls[i].p2);
-                        asprintfx(&rule, "%s: %u == %ld, %u == %ld", calls[i].name, calls[i].p1,
-                                  value, calls[i].p2, value2);
-                    }
-                    break;
-                }
-            }
-        }
-
-        rewind(whitelist);
-        char *line = NULL;
-        size_t len = 0;
-        ssize_t n_read;
-        while ((n_read = getline(&line, &len, whitelist)) != -1) {
-            if (line[n_read - 1] == '\n') line[n_read - 1] = '\0';
-            if (!strcmp(rule, line)) {
-                rule = NULL;
-                break;
-            }
-        }
-        if (ferror(whitelist)) {
-            err(EXIT_FAILURE, "getline");
-        }
-        free(line);
-
-        if (rule) {
-            fprintf(whitelist, "%s\n", rule);
-            free(rule);
-        }
+        // seccomp trap
+        // (for learn mode; removed)
     } else if ((status >> 8) == (SIGTRAP | PTRACE_EVENT_CLONE << 8)) {
         // new child
     } else if ((status >> 8) == (SIGTRAP | PTRACE_EVENT_FORK << 8)) {
@@ -374,8 +294,7 @@ static void do_trace(pid_t pid, int status, enum learn learn, FILE *whitelist) {
     check_posix(ptrace(PTRACE_CONT, pid, 0, inject_signal), "ptrace");
 }
 
-static void handle_signal(pid_t main_pid, int sig_fd, sd_bus *connection, const char *unit_name,
-                          enum learn learn, FILE *whitelist) {
+static void handle_signal(pid_t main_pid, int sig_fd, sd_bus *connection, const char *unit_name) {
     struct signalfd_siginfo si;
     ssize_t bytes_r = read(sig_fd, &si, sizeof(si));
     check_posix(bytes_r, "read");
@@ -400,7 +319,7 @@ static void handle_signal(pid_t main_pid, int sig_fd, sd_bus *connection, const 
     while ((pid = waitpid(-1, &status, WNOHANG|__WALL))) {
         check_posix(pid, "waitpid");
         if (WIFSTOPPED(status)) {
-            do_trace(pid, status, learn, whitelist);
+            do_trace(pid, status);
         } else if (WIFSIGNALED(status)) {
             errx(EXIT_FAILURE, "application terminated abnormally with signal %d (%s)",
                  WTERMSIG(status), strsignal(WTERMSIG(status)));
@@ -411,78 +330,6 @@ static void handle_signal(pid_t main_pid, int sig_fd, sd_bus *connection, const 
             exit(WEXITSTATUS(status));
         }
     }
-}
-
-static struct scmp_arg_cmp parse_parameter_check(const char *arg) {
-    char *end;
-    errno = 0;
-    long index = strtol(arg, &end, 10);
-    if (errno || index < 1 || (size_t)index > sizeof(arg_registers) / sizeof(arg_registers[0])) {
-        errx(EXIT_FAILURE, "invalid system call whitelist: invalid parameter index");
-    }
-    index--;
-
-    // skip whitespace
-    char *cursor = end + strspn(end, " \t");
-
-    enum scmp_compare op;
-    if (!strncmp(cursor, "!=", 2)) {
-        op = SCMP_CMP_NE;
-        cursor += 2;
-    } else if (!strncmp(cursor, "<", 1)) {
-        op = SCMP_CMP_LT;
-        cursor += 1;
-    } else if (!strncmp(cursor, "<=", 2)) {
-        op = SCMP_CMP_LE;
-        cursor += 2;
-    } else if (!strncmp(cursor, "==", 2)) {
-        op = SCMP_CMP_EQ;
-        cursor += 2;
-    } else if (!strncmp(cursor, ">=", 2)) {
-        op = SCMP_CMP_GE;
-        cursor += 2;
-    } else if (!strncmp(cursor, ">", 1)) {
-        op = SCMP_CMP_GT;
-        cursor += 1;
-    } else {
-        errx(EXIT_FAILURE, "invalid system call whitelist operator: %s", cursor);
-    }
-
-    errno = 0;
-    long value = strtol(cursor, &end, 10);
-    if (errno) {
-        errx(EXIT_FAILURE, "invalid system call whitelist: invalid parameter value");
-    }
-
-    // check for trailing garbage
-    if (*(end + strspn(end, " \t")) != '\0') {
-        errx(EXIT_FAILURE, "invalid system call whitelist: invalid parameter rule");
-    }
-
-    return SCMP_CMP(index, op, (unsigned long)value);
-}
-
-static struct scmp_arg_cmp *parse_parameter_checks(char *s, unsigned *count) {
-    struct scmp_arg_cmp *args = NULL;
-    unsigned n_args = 0;
-    for (char *s_ptr = s, *saveptr;; s_ptr = NULL) {
-        char *arg = strtok_r(s_ptr, ",", &saveptr);
-        if (!arg) break;
-        n_args++;
-        if (n_args > 10000) {
-            errx(EXIT_FAILURE, "too many parameter checks");
-        }
-        args = realloc(args, n_args * sizeof(struct scmp_arg_cmp));
-        if (!args) {
-            err(EXIT_FAILURE, "realloc");
-        }
-        args[n_args - 1] = parse_parameter_check(arg);
-    }
-    *count = n_args;
-    if (!n_args) {
-        errx(EXIT_FAILURE, "invalid system call whitelist: colon not followed by arguments");
-    }
-    return args;
 }
 
 static void iff_up_lo(void) {
@@ -514,15 +361,7 @@ static void iff_up_lo(void) {
 }
 
 static void handle_seccomp_rule(scmp_filter_ctx ctx, char *rule) {
-    char *split = strchr(rule, ':');
-    struct scmp_arg_cmp *args = NULL;
-    unsigned n_args = 0;
-    if (split) {
-        *split = '\0';
-        args = parse_parameter_checks(split + 1, &n_args);
-    }
-    check(seccomp_rule_add_array(ctx, SCMP_ACT_ALLOW, get_syscall_nr(rule), n_args, args));
-    free(args);
+    check(seccomp_rule_add_array(ctx, SCMP_ACT_ALLOW, get_syscall_nr(rule), 0, NULL));
 }
 
 int main(int argc, char **argv) {
@@ -531,6 +370,7 @@ int main(int argc, char **argv) {
     bool mount_proc = false;
     bool mount_dev = false;
     bool bringup_lo = false;
+    bool seccomp_log = false;
     const char *username = "nobody";
     const char *hostname = "playpen";
     long timeout = 0;
@@ -541,7 +381,6 @@ int main(int argc, char **argv) {
     char *devices = NULL;
     char *syscalls = NULL;
     const char *syscalls_file = NULL;
-    enum learn learn = LEARN_NONE;
 
     static const struct option opts[] = {
         { "help",          no_argument,       NULL, 'h' },
@@ -559,10 +398,9 @@ int main(int argc, char **argv) {
         { "devices",       required_argument, NULL, 'd' },
         { "syscalls",      required_argument, NULL, 's' },
         { "syscalls-file", required_argument, NULL, 'S' },
-        { "learn",         no_argument,       NULL, 'l' },
-        { "learn-coarse",  no_argument,       NULL, 'L' },
         { "no-cloexec",    required_argument, NULL, 'N' },
         { "bringup-lo",    no_argument,       NULL, 'P' },
+        { "log",           no_argument,       NULL, 'l' },
         { NULL, 0, NULL, 0 }
     };
 
@@ -619,25 +457,18 @@ int main(int argc, char **argv) {
         case 'S':
             syscalls_file = optarg;
             break;
-        case 'l':
-            learn = LEARN_FINE;
-            break;
-        case 'L':
-            learn = LEARN_COARSE;
-            break;
         case 'N':
             check_posix(ioctl(strtolx_positive(optarg, "fd"), FIONCLEX), "ioctl");
             break;
         case 'P':
             bringup_lo = true;
             break;
+        case 'l':
+            seccomp_log = true;
+            break;
         default:
             usage(stderr);
         }
-    }
-
-    if (learn != LEARN_NONE && !syscalls_file) {
-        errx(EXIT_FAILURE, "learning mode requires specifying a system call whitelist");
     }
 
     if (argc - optind < 2) {
@@ -647,12 +478,12 @@ int main(int argc, char **argv) {
     const char *root = argv[optind];
     optind++;
 
-    scmp_filter_ctx ctx = seccomp_init(learn != LEARN_NONE ? SCMP_ACT_TRACE(0) : SCMP_ACT_ERRNO(EPERM));
+    scmp_filter_ctx ctx = seccomp_init(seccomp_log ? SCMP_ACT_LOG : SCMP_ACT_ERRNO(EPERM));
     if (!ctx) errx(EXIT_FAILURE, "seccomp_init");
 
     FILE *whitelist = NULL;
     if (syscalls_file) {
-        whitelist = fopen(syscalls_file, learn != LEARN_NONE ? "a+e" : "re");
+        whitelist = fopen(syscalls_file, "re");
         if (!whitelist) err(EXIT_FAILURE, "failed to open syscalls file: %s", syscalls_file);
         char *line = NULL;
         size_t len = 0;
@@ -665,10 +496,6 @@ int main(int argc, char **argv) {
             err(EXIT_FAILURE, "getline");
         }
         free(line);
-        if (learn == LEARN_NONE) {
-            fclose(whitelist);
-            whitelist = NULL;
-        }
     }
 
     check(seccomp_rule_add(ctx, SCMP_ACT_ALLOW, __NR_execve, 0));
@@ -835,11 +662,6 @@ int main(int argc, char **argv) {
     bind_list_free(binds);
     seccomp_release(ctx);
 
-    if (learn != LEARN_NONE) {
-        long trace_flags = PTRACE_O_TRACECLONE|PTRACE_O_TRACEFORK|PTRACE_O_TRACESECCOMP|PTRACE_O_TRACEVFORK;
-        check_posix(ptrace(PTRACE_SEIZE, pid, NULL, trace_flags), "ptrace");
-    }
-
     sd_bus *connection;
     check(sd_bus_open_system(&connection));
 
@@ -889,7 +711,7 @@ int main(int argc, char **argv) {
                     stop_scope_unit(connection, unit_name);
                     return EXIT_FAILURE;
                 } else if (evt->data.fd == sig_fd) {
-                    handle_signal(pid, sig_fd, connection, unit_name, learn, whitelist);
+                    handle_signal(pid, sig_fd, connection, unit_name);
                 } else if (evt->data.fd == pipe_out[0]) {
                     copy_to_stdstream(pipe_out[0], STDOUT_FILENO);
                 } else if (evt->data.fd == pipe_err[0]) {
